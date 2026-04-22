@@ -2,46 +2,66 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 # =========================
+# Device
+# =========================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# =========================
 # Hyperparameters
 # =========================
-input_dim = 784   # 28x28 images
-hidden_dim = 800
-latent_dim = 100
+latent_dim = 64
 batch_size = 128
-epochs = 50
+epochs = 20
 lr = 1e-3
 
 # =========================
-# Data
+# Data (Train + Test split)
 # =========================
 transform = transforms.ToTensor()
 
-train_dataset = datasets.MNIST(root='./data', train=True, transform=transform, download=True)
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+train_dataset = datasets.MNIST(root="./data", train=True, transform=transform, download=True)
+test_dataset = datasets.MNIST(root="./data", train=False, transform=transform, download=True)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # =========================
-# VAE Model
+# Convolutional VAE
 # =========================
-class VAE(nn.Module):
+class ConvVAE(nn.Module):
     def __init__(self):
-        super(VAE, self).__init__()
+        super().__init__()
 
         # Encoder
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
-        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 32, 4, 2, 1),  # 28 -> 14
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2, 1), # 14 -> 7
+            nn.ReLU()
+        )
+
+        self.fc_mu = nn.Linear(64 * 7 * 7, latent_dim)
+        self.fc_logvar = nn.Linear(64 * 7 * 7, latent_dim)
 
         # Decoder
-        self.fc2 = nn.Linear(latent_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, input_dim)
+        self.fc = nn.Linear(latent_dim, 64 * 7 * 7)
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),  # 7 -> 14
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 1, 4, 2, 1),   # 14 -> 28
+            nn.Sigmoid()
+        )
 
     def encode(self, x):
-        h = torch.relu(self.fc1(x))
-        return self.fc_mu(h), self.fc_logvar(h)
+        x = self.encoder(x)
+        x = x.view(x.size(0), -1)
+        return self.fc_mu(x), self.fc_logvar(x)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -49,101 +69,112 @@ class VAE(nn.Module):
         return mu + eps * std
 
     def decode(self, z):
-        h = torch.relu(self.fc2(z))
-        return torch.sigmoid(self.fc3(h))
+        x = self.fc(z)
+        x = x.view(-1, 64, 7, 7)
+        return self.decoder(x)
 
     def forward(self, x):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
 
+model = ConvVAE().to(device)
+optimizer = optim.Adam(model.parameters(), lr=lr)
 
 # =========================
-# Loss Function
+# Loss
 # =========================
-def loss_function(recon_x, x, mu, logvar):
-    BCE = nn.functional.binary_cross_entropy(recon_x, x, reduction='sum')
+def loss_function(recon, x, mu, logvar):
+    BCE = nn.functional.binary_cross_entropy(recon, x, reduction="sum")
     KL = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     return BCE + KL
-
 
 # =========================
 # Training
 # =========================
-model = VAE()
-optimizer = optim.Adam(model.parameters(), lr=lr)
-
 for epoch in range(epochs):
+    model.train()
     total_loss = 0
 
-    loop = tqdm(train_loader, leave=True)
+    loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
 
-    for data, _ in loop:
-        data = data.view(-1, 784)
-        original = data.clone()
-        data[:, :392] = 0 
+    for x, _ in loop:
+        x = x.to(device)
+
+        # Crop input (LEFT HALF REMOVED)
+        target = x.clone()
+        x[:, :, :, :14] = 0
 
         optimizer.zero_grad()
-        recon, mu, logvar = model(data)
-        loss = loss_function(recon, original, mu, logvar)
+
+        recon, mu, logvar = model(x)
+        loss = loss_function(recon, target, mu, logvar)
 
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
-
-        # Update progress bar
-        loop.set_description(f"Epoch [{epoch+1}/{epochs}]")
         loop.set_postfix(loss=loss.item())
 
-    print(f"Epoch {epoch+1} Total Loss: {total_loss:.2f}")
-
+    print(f"Epoch {epoch+1}, Total Loss: {total_loss:.2f}")
 
 # =========================
-# Test Reconstruction
+# TESTING (separate data)
 # =========================
-data_iter = iter(train_loader)
-images, _ = next(data_iter)
+model.eval()
 
-images_flat = images.view(-1, 784)
-recon_images, _, _ = model(images_flat)
+data, _ = next(iter(test_loader))
+data = data.to(device)
 
-# Show original vs reconstructed
+target = data.clone()
+corrupted = data.clone()
+
+# crop center
+corrupted[:, :, :, 7:21] = 0
+corrupted[:, :, 7:21, :] = 0
+
+with torch.no_grad():
+    recon, _, _ = model(corrupted)
+
+# =========================
+# VISUALIZATION
+# =========================
 plt.figure(figsize=(10, 6))
 
 for i in range(5):
-    # Cropped input
+    # input
     plt.subplot(3, 5, i+1)
-    plt.imshow(data[i].view(28,28).detach().numpy(), cmap='gray')
+    plt.imshow(corrupted[i].cpu().squeeze(), cmap="gray")
     plt.title("Input")
-    plt.axis('off')
+    plt.axis("off")
 
-    # Original
+    # original
     plt.subplot(3, 5, i+6)
-    plt.imshow(original[i].view(28,28).detach().numpy(), cmap='gray')
+    plt.imshow(target[i].cpu().squeeze(), cmap="gray")
     plt.title("Original")
-    plt.axis('off')
+    plt.axis("off")
 
-    # Reconstructed
+    # reconstruction
     plt.subplot(3, 5, i+11)
-    plt.imshow(recon[i].view(28,28).detach().numpy(), cmap='gray')
-    plt.title("Reconstructed")
-    plt.axis('off')
+    plt.imshow(recon[i].cpu().squeeze(), cmap="gray")
+    plt.title("Output")
+    plt.axis("off")
 
 plt.show()
 
-
 # =========================
-# Generate New Images
+# IMAGE GENERATION
 # =========================
-z = torch.randn(10, latent_dim)
-generated = model.decode(z)
+z = torch.randn(16, latent_dim).to(device)
 
-plt.figure(figsize=(8, 2))
+with torch.no_grad():
+    samples = model.decode(z)
 
-for i in range(10):
-    plt.subplot(1, 10, i+1)
-    plt.imshow(generated[i].view(28, 28).detach().numpy(), cmap='gray')
-    plt.axis('off')
+plt.figure(figsize=(6, 6))
+
+for i in range(16):
+    plt.subplot(4, 4, i+1)
+    plt.imshow(samples[i].cpu().squeeze(), cmap="gray")
+    plt.axis("off")
 
 plt.show()
